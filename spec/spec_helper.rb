@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "ollama/stream"
+require_relative "../../integration_helper"
 
 RSpec.configure do |config|
   # Enable flags like --only-failures and --next-failure
