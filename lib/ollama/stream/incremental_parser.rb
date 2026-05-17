@@ -4,7 +4,11 @@ require "json"
 
 module Ollama
   module Stream
-    # Advanced incremental parser for safe recovery of malformed JSON chunks.
+    # Incremental NDJSON parser with safe recovery for fragmented chunks.
+    #
+    # Ollama emits newline-delimited JSON. This parser buffers partial lines
+    # across chunks and returns parsed objects only for completed lines.
+    # Invalid JSON lines are skipped (not raised) to keep the stream resilient.
     class IncrementalParser
       attr_reader :buffer
 
@@ -12,33 +16,39 @@ module Ollama
         @buffer = +""
       end
 
-      # Parses a stream chunk, buffering incomplete JSON fragments.
-      # @param chunk [String]
-      # @return [String, Hash, nil]
+      # Append a chunk and return an Array of any complete JSON objects now parseable.
+      # Incomplete trailing data stays in the buffer.
       def parse_chunk(chunk)
-        return chunk unless chunk.is_a?(String)
+        return [] if chunk.nil?
 
-        @buffer << chunk
-        stripped = @buffer.strip
+        @buffer << chunk.to_s
+        results = []
 
-        if stripped.start_with?("{")
-          if stripped.end_with?("}")
-            begin
-              parsed = JSON.parse(@buffer)
-              @buffer.clear
-              return parsed
-            rescue JSON::ParserError
-              # Incomplete JSON, keep buffering
-              return nil
-            end
-          else
-            # Incomplete JSON object, keep buffering
-            return nil
+        while (idx = @buffer.index("\n"))
+          line = @buffer.slice!(0, idx + 1).chomp
+          next if line.strip.empty?
+
+          begin
+            results << JSON.parse(line)
+          rescue JSON::ParserError
+            # Malformed line — drop and continue rather than break the stream.
           end
         end
 
-        # For plain text token streaming, return the chunk directly
-        chunk
+        results
+      end
+
+      # Force-parse any remaining buffered text (call at stream end).
+      def flush
+        return [] if @buffer.strip.empty?
+
+        leftover = @buffer.dup
+        @buffer.clear
+        begin
+          [JSON.parse(leftover)]
+        rescue JSON::ParserError
+          []
+        end
       end
     end
   end

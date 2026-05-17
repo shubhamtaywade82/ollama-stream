@@ -1,11 +1,25 @@
 # frozen_string_literal: true
 
-require "fiber"
+require "thread"
 
 module Ollama
   module Stream
-    # Formal stream object encapsulating an Ollama SSE stream.
+    # Formal stream wrapper over an Ollama chat call.
+    #
+    # Runs `client.chat` on a producer thread that pushes events into a
+    # bounded queue. The consumer (`each_token`) pulls events on the caller's
+    # thread, giving you natural backpressure (producer blocks when the queue
+    # is full) plus pause/cancel semantics that work mid-stream.
+    #
+    # Event tuples on the queue:
+    #   [:token, String]
+    #   [:thought, String]
+    #   [:tool_call, Hash]
+    #   [:error, Exception]
+    #   [:complete]
     class StreamObject
+      SENTINEL = :__ollama_stream_done__
+
       attr_reader :client, :model, :messages, :options, :status, :flow_controller, :incremental_parser
 
       def initialize(client, model:, messages:, options: {}, flow_controller: nil, incremental_parser: nil)
@@ -16,59 +30,44 @@ module Ollama
         @flow_controller = flow_controller || FlowController.new
         @incremental_parser = incremental_parser || IncrementalParser.new
         @status = :idle
-        @fiber = nil
+        @cancelled = false
       end
 
-      # Yields each token or event from the stream.
-      # Supports pause, resume, and cancellation.
       def each_token(&block)
         return enum_for(:each_token) unless block
 
         @status = :running
-        @fiber = Fiber.new do
-          hooks = {
-            on_token: ->(text, _logprobs = nil) {
-              Fiber.yield([:token, text]) if @status == :running
-            },
-            on_thought: ->(text) {
-              Fiber.yield([:thought, text]) if @status == :running
-            },
-            on_tool_call: ->(tc) {
-              Fiber.yield([:tool_call, tc]) if @status == :running
-            },
-            on_error: ->(err) {
-              Fiber.yield([:error, err])
-            },
-            on_complete: -> {
-              Fiber.yield([:complete, nil])
-            }
-          }
+        @cancelled = false
+        producer = start_producer
 
-          begin
-            @client.chat(model: @model, messages: @messages, options: @options, hooks: hooks)
-          rescue StandardError => e
-            Fiber.yield([:error, e])
+        begin
+          loop do
+            @flow_controller.wait_if_paused!
+            if @cancelled
+              @status = :cancelled
+              break
+            end
+
+            event = @flow_controller.pop
+            break if event == SENTINEL
+
+            type, payload = event
+            case type
+            when :token, :thought
+              block.call(payload)
+            when :tool_call
+              block.call(payload)
+            when :error
+              @status = :error
+              raise payload
+            when :complete
+              @status = :completed
+              break
+            end
           end
-        end
-
-        while @fiber.alive? && @status == :running
-          @flow_controller.wait_if_paused!
-          break if @status == :cancelled
-
-          event, data = @fiber.resume
-          case event
-          when :token, :thought
-            parsed = @incremental_parser.parse_chunk(data)
-            block.call(parsed) if parsed
-          when :tool_call
-            block.call(data)
-          when :error
-            @status = :error
-            raise data
-          when :complete
-            @status = :completed
-            break
-          end
+        ensure
+          producer.kill if producer.alive?
+          @flow_controller.close
         end
       end
 
@@ -83,7 +82,29 @@ module Ollama
       end
 
       def cancel
-        @status = :cancelled
+        @cancelled = true
+        @flow_controller.resume! if @flow_controller.paused?
+        @flow_controller.push(SENTINEL) rescue nil
+      end
+
+      private
+
+      def start_producer
+        Thread.new do
+          hooks = {
+            on_token:     ->(text, _lp = nil) { @flow_controller.push([:token, text]) unless @cancelled },
+            on_thought:   ->(text)            { @flow_controller.push([:thought, text]) unless @cancelled },
+            on_tool_call: ->(tc)              { @flow_controller.push([:tool_call, tc]) unless @cancelled },
+            on_error:     ->(err)             { @flow_controller.push([:error, err]) },
+            on_complete:  ->                  { @flow_controller.push([:complete, nil]) }
+          }
+
+          begin
+            @client.chat(model: @model, messages: @messages, options: @options, hooks: hooks)
+          rescue StandardError => e
+            @flow_controller.push([:error, e]) rescue nil
+          end
+        end
       end
     end
   end

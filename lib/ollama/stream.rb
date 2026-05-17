@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "ollama_client"
 require_relative "stream/version"
 require_relative "stream/flow_controller"
 require_relative "stream/incremental_parser"

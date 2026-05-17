@@ -26,6 +26,10 @@ module Ollama
 
         StreamObject.new(@client, model: model, messages: @history)
       end
+
+      def append_assistant(content)
+        @history << { role: "assistant", content: content }
+      end
     end
   end
 end
